@@ -18,12 +18,12 @@ class UAVEnv(gym.Env):
         self.payload_max = 30
         self.drag_coeff = 1.1
         self.fluid_density = 1.0
-        self.cross_section_area = 0.08
         self.max_acc = 6.0
         self.max_speed = 20.0
         self.max_dist = 1000.0
-        self.max_steps = 10000
-        self.wind_max = 6.0
+        self.max_steps = 20000
+        self.wind_max = 6.0 
+        self.cross_section_area = 760* (1e-3)*1027* (1e-3)
         self.goal_radius = 1.0
         self.alpha_energy = 0.05
         self.beta_smooth = 0.001
@@ -112,7 +112,6 @@ class UAVEnv(gym.Env):
         progress = self.prev_dist - dist
         self.prev_dist = dist
 
-        # Reward calculation
         reward = self.progress_scale * progress \
              - self.alpha_energy * energy \
              - self.step_penalty \
@@ -142,14 +141,13 @@ def make_env(seed=0):
 
 
 if __name__ == "__main__":
-    alpha_values = [0.01, 0.05, 0.1]  # Try different alpha_energy penalties
+    alpha_values = [0.01, 0.05, 0.1]
 
-    results = {}  # Store results for each alpha
+    results = {}  
 
     for alpha in alpha_values:
         print(f"\n=== Testing alpha_energy = {alpha} ===")
 
-        # Create environment with custom alpha_energy
         def make_env_with_alpha(seed=0):
             env = UAVEnv(seed=seed)
             env.alpha_energy = alpha
@@ -160,11 +158,9 @@ if __name__ == "__main__":
                 gae_lambda=0.95, gamma=0.995, n_epochs=20,
                 learning_rate=3e-4, clip_range=0.2, device="cpu")
 
-        # Train agent
-        model.learn(total_timesteps=200000)  # Reduced for faster testing
+        model.learn(total_timesteps=200000)
         env.close()
 
-        # Test agent
         test_env = make_env_with_alpha(seed=42)
         obs, _ = test_env.reset()
         done = False
@@ -178,7 +174,6 @@ if __name__ == "__main__":
             "energies": test_env.energies
         }
 
-    # Combined plot
     fig, ax1 = plt.subplots()
 
     ax1.set_xlabel("Step")
@@ -195,7 +190,6 @@ if __name__ == "__main__":
     for i, alpha in enumerate(alpha_values):
         ax2.plot(results[alpha]["energies"], color=colors_energy[i], linestyle="--", label=f"Energy α={alpha}")
 
-    # Combine legends
     lines_1, labels_1 = ax1.get_legend_handles_labels()
     lines_2, labels_2 = ax2.get_legend_handles_labels()
     ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc="upper right")
@@ -203,4 +197,23 @@ if __name__ == "__main__":
     plt.title("UAV Distance & Energy Consumption for Different α Values")
     fig.tight_layout()
     plt.savefig("plot.png")
-    # tradeoff between energy and distance
+    
+    # ...existing code...
+
+    plt.title("UAV Distance & Energy Consumption for Different α Values")
+    fig.tight_layout()
+    plt.savefig("plot.png")
+
+    # --- New plot: Accumulated energy vs steps ---
+    plt.figure()
+    for i, alpha in enumerate(alpha_values):
+        energies = np.array(results[alpha]["energies"])
+        accumulated_energy = np.cumsum(energies)
+        plt.plot(accumulated_energy, label=f"α={alpha}")
+    plt.xlabel("Step")
+    plt.ylabel("Accumulated Energy (J)")
+    plt.title("Accumulated Energy vs Steps for Different α Values")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("accumulated_energy.png")
