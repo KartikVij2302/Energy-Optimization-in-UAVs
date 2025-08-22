@@ -1,4 +1,4 @@
-from drone.py import CustomEnv
+from drone import CustomEnv
 import gym
 
 env = CustomEnv()
