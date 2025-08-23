@@ -1,0 +1,308 @@
+import numpy as np
+import gymnasium as gym
+from gymnasium import spaces
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+import matplotlib.pyplot as plt
+
+# Custom UAV environment for reinforcement learning
+class UAVEnv(gym.Env):
+    metadata = {"render_modes": []}
+    def __init__(self, seed=0):
+        super().__init__()
+        # Environment parameters
+        self.dt = 0.1  # time step
+        self.drone_mass = 65
+        self.payload_min = 0.0
+        self.payload_max = 30
+        self.drag_coeff = 1.1
+        self.fluid_density = 1.0
+        self.max_acc = 6.0
+        self.max_speed = 20.0
+        self.max_dist = 1000.0
+        self.max_steps = 40000
+        self.wind_max = 6.0 
+        self.cross_section_area = 760* (1e-3)*1027* (1e-3)
+        self.goal_radius = 4.0
+        self.alpha_energy = 0.05
+        self.beta_smooth = 0.001
+        self.success_bonus = 100.0
+        self.step_penalty = 0.01
+        self.progress_scale = 1.0
+        self.obstacle_penalty_coef = 5.0  # Penalty coefficient for obstacle collision
+
+        # Observation and action space definitions
+        low = np.array([-self.max_dist, -self.max_dist, -self.max_speed, -self.max_speed,
+                        -self.max_acc, -self.max_acc, -self.wind_max, -self.wind_max, 0.0], dtype=np.float32)
+        high = np.array([ self.max_dist,  self.max_dist,  self.max_speed,  self.max_speed,
+                          self.max_acc,  self.max_acc,  self.wind_max,  self.wind_max, self.payload_max], dtype=np.float32)
+        self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
+        self.action_space = spaces.Box(low=-self.max_acc, high=self.max_acc, shape=(2,), dtype=np.float32)
+
+        # Random number generator
+        self.np_random, _ = gym.utils.seeding.np_random(seed)
+        self.distances = []
+        self.energies = []
+        self.obstacles = None  # Will be set in reset
+        self.reset(seed=seed)
+
+    # Calculate drag force based on relative velocity
+    def _drag(self, v_rel):
+        s = np.linalg.norm(v_rel)
+        if s == 0.0:
+            return np.zeros(2, dtype=np.float32), 0.0
+        mag = 0.5 * self.fluid_density * (s**2) * self.drag_coeff * self.cross_section_area
+        vec = -mag * (v_rel / s)
+        return vec.astype(np.float32), mag
+
+    # Clip vector to a maximum norm
+    def _clip_vec(self, vec, max_norm):
+        n = np.linalg.norm(vec)
+        if n > max_norm:
+            return vec * (max_norm / (n + 1e-8))
+        return vec
+    
+    def distance_to_obstacle(self,drone_pos, obstacles):
+        """
+        Calculate the minimum distance from the drone to any obstacle.
+        Each obstacle is a tuple (center_x, center_y, radius).
+        Returns the minimum distance (negative if inside any obstacle).
+        """
+        min_dist = float('inf')
+        for (cx, cy, r) in obstacles:
+            dist = np.linalg.norm(drone_pos - np.array([cx, cy])) - r
+            if dist < min_dist:
+                min_dist = dist
+        return min_dist
+
+    def generate_random_obstacles(self, num_obstacles, min_radius=20, max_radius=100):
+        """
+        Randomly generate a list of circular obstacles.
+        Each obstacle is represented as (center_x, center_y, radius).
+        Ensures that the start (self.pos) and goal (self.goal) are not inside any obstacle.
+        """
+        obstacles = []
+        while len(obstacles) < num_obstacles:
+            center = self.np_random.uniform(-self.max_dist, self.max_dist, size=2)
+            radius = self.np_random.uniform(min_radius, max_radius)
+            dist_start = np.linalg.norm(self.pos - center)
+            dist_goal = np.linalg.norm(self.goal - center)
+            # Ensure start and goal are outside the obstacle
+            if dist_start > radius and dist_goal > radius:
+                obstacles.append((center[0], center[1], radius))
+        return obstacles
+
+    # Reset environment to initial state
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            self.np_random, _ = gym.utils.seeding.np_random(seed)
+        self.payload = float(self.np_random.uniform(self.payload_min, self.payload_max))
+        self.pos = self.np_random.uniform(-self.max_dist, self.max_dist, size=(2,)).astype(np.float32)
+        gdir = np.sign(self.np_random.uniform(-1, 1, size=(2,)))
+        self.goal = self.np_random.uniform(-self.max_dist,self.max_dist,size=(2,)).astype(np.float32) * gdir
+        self.vel = np.zeros(2, dtype=np.float32)
+        self.acc = np.zeros(2, dtype=np.float32)
+        self.wind = self.np_random.uniform(-self.wind_max, self.wind_max, size=(2,)).astype(np.float32)
+        self.steps = 0
+        self.prev_dist = float(np.linalg.norm(self.goal - self.pos))
+        self.distances = [self.prev_dist]
+        self.energies = [0.0]  # start with zero energy
+
+        # Generate obstacles if not already present or if you want to regenerate every episode
+        self.obstacles = self.generate_random_obstacles(num_obstacles=5)
+
+        return self._get_obs(), {}
+
+    # Get current observation
+    def _get_obs(self):
+        rel = (self.goal - self.pos).astype(np.float32)
+        return np.array([rel[0], rel[1], self.vel[0], self.vel[1],
+                         self.acc[0], self.acc[1], self.wind[0], self.wind[1], self.payload], dtype=np.float32)
+        
+    def _get_reward(self,action,progress,energy,dist_to_obstacle):
+        # print(f"Progress reward:{self.progress_scale*progress}")
+        # print(f"Energy reward:{-self.alpha_energy*energy}")
+        # print("Step penalty:",-self.step_penalty)
+        # print(self.beta_smooth*float(np.dot(action,action)))
+        # print("Obstacle avoidance reward:",-self.obstacle_penalty_coef*max(0,-dist_to_obstacle))
+        reward = self.progress_scale * progress \
+             - self.alpha_energy * energy \
+             - self.obstacle_penalty_coef * dist_to_obstacle
+        return reward
+        
+
+    # Step the environment by one timestep
+    def step(self, action):
+        action = np.asarray(action, dtype=np.float32)
+        action = self._clip_vec(action, self.max_acc)
+        self.acc = self.acc + action
+        self.acc = np.clip(self.acc, -self.max_acc, self.max_acc)
+
+        m = self.drone_mass + self.payload
+        v_rel = self.vel - self.wind
+        drag_vec, _ = self._drag(v_rel)
+        thrust_force = m * self.acc
+        power = float(np.dot(thrust_force, self.vel))
+        if power < 0.0:
+            power = 0.0
+        energy = power * self.dt
+        self.energies.append(energy)
+
+        acc_eff = self.acc + drag_vec / m
+        self.vel = self.vel + acc_eff * self.dt
+        self.vel = self._clip_vec(self.vel, self.max_speed)
+        self.pos = self.pos + self.vel * self.dt
+        self.steps += 1
+
+        dist = float(np.linalg.norm(self.goal - self.pos))
+        self.distances.append(dist)
+        progress = self.prev_dist - dist
+        self.prev_dist = dist
+
+        obs = self._get_obs()
+        dist_to_obstacle = self.distance_to_obstacle(self.pos, self.obstacles)
+        reward = self._get_reward(action,progress,energy,dist_to_obstacle)
+
+        terminated = False
+        truncated = False
+        if dist <= self.goal_radius:
+            reward += self.success_bonus
+            terminated = True
+        if np.linalg.norm(self.pos) > self.max_dist:
+            truncated = True
+            reward -= 10.0
+        if self.steps >= self.max_steps:
+            truncated = True
+
+        info = {"energy": energy, "dist": dist, "dist_to_obstacle": dist_to_obstacle}
+        return obs, reward, terminated, truncated, info
+
+
+# Explanation of self.prev_dist usage:
+
+# self.prev_dist is used to keep track of the drone's distance to the goal at the previous timestep.
+# It is initialized in reset() as the initial distance from the start position to the goal:
+#     self.prev_dist = float(np.linalg.norm(self.goal - self.pos))
+# In each step(), after the drone moves, the new distance to the goal is computed:
+#     dist = float(np.linalg.norm(self.goal - self.pos))
+# The progress towards the goal is then calculated as the difference:
+#     progress = self.prev_dist - dist
+# This value (progress) is used in the reward function to encourage the drone to move closer to the goal.
+# After calculating progress, self.prev_dist is updated to the current distance for use in the next step:
+#     self.prev_dist = dist
+# This mechanism ensures that the reward reflects the improvement (or lack thereof) in each step.
+
+
+# Helper function to create environment with a given seed
+def make_env(seed=0):
+    def _f():
+        return UAVEnv(seed=seed)
+    return _f
+
+def plot_path_with_obstacles(positions, obstacles, start, goal, filename):
+    """
+    Plot the UAV path, obstacles, start and goal points.
+    """
+    plt.figure(figsize=(8, 8))
+    # Plot obstacles
+    for (cx, cy, r) in obstacles:
+        circle = plt.Circle((cx, cy), r, color='red', alpha=0.3)
+        plt.gca().add_patch(circle)
+        plt.plot(cx, cy, 'rx', markersize=8, alpha=0.5)
+    # Plot path
+    positions = np.array(positions)
+    plt.plot(positions[:, 0], positions[:, 1], 'b-', label='UAV Path')
+    # Plot start and goal
+    plt.plot(start[0], start[1], 'go', markersize=10, label='Start')
+    plt.plot(goal[0], goal[1], 'mo', markersize=10, label='Goal')
+    plt.xlabel("X Position")
+    plt.ylabel("Y Position")
+    plt.title("UAV Path with Obstacles")
+    plt.legend()
+    plt.axis('equal')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+
+
+if __name__ == "__main__":
+    alpha_values = [0.01, 0.05, 0.1]
+
+    results = {}  
+
+    for alpha in alpha_values:
+        print(f"\n=== Testing alpha_energy = {alpha} ===")
+
+        def make_env_with_alpha(seed=0):
+            env = UAVEnv(seed=seed)
+            env.alpha_energy = alpha
+            return env
+
+        env = DummyVecEnv([lambda: make_env_with_alpha(0)])
+        model = PPO("MlpPolicy", env, verbose=0, n_steps=1024, batch_size=256,
+                gae_lambda=0.95, gamma=0.995, n_epochs=20,
+                learning_rate=2e-4, clip_range=0.2, device="cpu")
+
+        model.learn(total_timesteps=200000)
+        env.close()
+
+        test_env = make_env_with_alpha(seed=42)
+        obs, _ = test_env.reset()
+        done = False
+        truncated = False
+        positions = [test_env.pos.copy()]  # Store positions for path plot
+        while not (done or truncated):
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, truncated, info = test_env.step(action)
+            positions.append(test_env.pos.copy())
+        results[alpha] = {
+            "distances": test_env.distances,
+            "energies": test_env.energies
+        }
+        # Plot path with obstacles for this alpha
+        plot_path_with_obstacles(
+            positions,
+            test_env.obstacles,
+            positions[0],
+            test_env.goal,
+            f"path_alpha_{alpha}.png"
+        )
+
+    fig, ax1 = plt.subplots()
+
+    ax1.set_xlabel("Step")
+    ax1.set_ylabel("Distance to Goal (m)")
+    ax1.grid(True)
+
+    colors = ["tab:blue", "tab:green", "tab:purple"]
+    for i, alpha in enumerate(alpha_values):
+        ax1.plot(results[alpha]["distances"], color=colors[i], label=f"Dist α={alpha}")
+
+    ax2 = ax1.twinx()
+    ax2.set_ylabel("Energy per Step (J)")
+    colors_energy = ["tab:red", "tab:orange", "tab:pink"]
+    for i, alpha in enumerate(alpha_values):
+        ax2.plot(results[alpha]["energies"], color=colors_energy[i], linestyle="--", label=f"Energy α={alpha}")
+
+    lines_1, labels_1 = ax1.get_legend_handles_labels()
+    lines_2, labels_2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines_1 + lines_2, labels_1 + labels_2, loc="upper right")
+
+    plt.title("UAV Distance & Energy Consumption for Different α Values")
+    fig.tight_layout()
+    plt.savefig("plot.png")
+    
+    # --- New plot: Accumulated energy vs steps ---
+    plt.figure()
+    for i, alpha in enumerate(alpha_values):
+        energies = np.array(results[alpha]["energies"])
+        accumulated_energy = np.cumsum(energies)
+        plt.plot(accumulated_energy, label=f"α={alpha}")
+    plt.xlabel("Step")
+    plt.ylabel("Accumulated Energy (J)")
+    plt.title("Accumulated Energy vs Steps for Different α Values")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig("accumulated_energy.png")

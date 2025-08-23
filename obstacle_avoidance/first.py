@@ -58,26 +58,6 @@ class UAVEnv(gym.Env):
             return vec * (max_norm / (n + 1e-8))
         return vec
 
-    def reset(self, seed=None, options=None):
-        if seed is not None:
-            self.np_random, _ = gym.utils.seeding.np_random(seed)
-        self.payload = float(self.np_random.uniform(self.payload_min, self.payload_max))
-        self.pos = self.np_random.uniform(-50.0, 50.0, size=(2,)).astype(np.float32)
-        gdir = np.sign(self.np_random.uniform(-1, 1, size=(2,)))
-        self.goal = self.np_random.uniform(80.0, 120.0, size=(2,)).astype(np.float32) * gdir
-        self.vel = np.zeros(2, dtype=np.float32)
-        self.acc = np.zeros(2, dtype=np.float32)
-        self.wind = self.np_random.uniform(-self.wind_max, self.wind_max, size=(2,)).astype(np.float32)
-        self.steps = 0
-        self.distances = [np.linalg.norm(self.goal - self.pos)]
-        self.energies = []
-        self.obs_distances = []
-
-        # Place obstacle randomly
-        self.obstacle_pos = self.np_random.uniform(-40, 40, size=(2,)).astype(np.float32)
-        self.obstacle_radius = 10.0
-
-        return self._get_obs(), {}
 
     def _get_obs(self):
         rel = (self.goal - self.pos).astype(np.float32)
@@ -104,8 +84,8 @@ class UAVEnv(gym.Env):
         self.pos = self.pos + self.vel * self.dt
         self.steps += 1
 
-        dist = float(np.linalg.norm(self.goal - self.pos))
-        self.distances.append(dist)
+        dist_from_goal = float(np.linalg.norm(self.goal - self.pos))
+        self.distances.append(dist_from_goal)
 
         # Distance to obstacle
         obs_dist = float(np.linalg.norm(self.obstacle_pos - self.pos)) - self.obstacle_radius
@@ -113,13 +93,11 @@ class UAVEnv(gym.Env):
 
         # Reward: closer to goal, farther from obstacle, low energy
         reward = (
-            -dist
+            -dist_from_goal
             + self.avoidance_weight * max(obs_dist, 0)  # reward distance from obstacle
-            - self.alpha_energy * energy
-            - self.step_penalty
-            - self.beta_smooth * float(np.dot(action, action))
+            - self.alpha_energy * energy * 10
         )
-
+       
         terminated = False
         truncated = False
 
@@ -127,7 +105,7 @@ class UAVEnv(gym.Env):
             reward -= 1000.0
             terminated = True
 
-        if dist <= self.goal_radius:  # reached goal
+        if dist_from_goal <= self.goal_radius:  # reached goal
             reward += self.success_bonus
             terminated = True
 
@@ -139,9 +117,27 @@ class UAVEnv(gym.Env):
             truncated = True
 
         obs = self._get_obs()
-        info = {"energy": energy, "dist": dist, "obs_dist": obs_dist}
+        info = {"energy": energy, "dist": dist_from_goal, "obs_dist": obs_dist}
         return obs, reward, terminated, truncated, info
 
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            self.np_random, _ = gym.utils.seeding.np_random(seed)
+        self.payload = float(self.np_random.uniform(self.payload_min, self.payload_max))
+        self.pos = self.np_random.uniform(-50.0, 50.0, size=(2,)).astype(np.float32)
+        gdir = np.sign(self.np_random.uniform(-1, 1, size=(2,)))
+        self.goal = self.np_random.uniform(80.0, 120.0, size=(2,)).astype(np.float32) * gdir
+        self.vel = np.zeros(2, dtype=np.float32)
+        self.acc = np.zeros(2, dtype=np.float32)
+        self.wind = self.np_random.uniform(-self.wind_max, self.wind_max, size=(2,)).astype(np.float32)
+        self.steps = 0
+        self.distances = [np.linalg.norm(self.goal - self.pos)]
+        self.energies = []
+        self.obs_distances = []
+
+        self.obstacle_pos = self.np_random.uniform(-40, 40, size=(2,)).astype(np.float32)
+
+        return self._get_obs(), {}
 
 # === Training & Testing ===
 def make_env_with_alpha(alpha, seed=0):

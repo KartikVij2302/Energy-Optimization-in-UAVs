@@ -21,7 +21,7 @@ class UAVEnv(gym.Env):
         self.cross_section_area = 0.08
         self.max_acc = 6.0
         self.max_dacc = 4.0
-        self.max_speed = 12.0
+        self.max_speed = 20.0
         self.max_dist = 2000.0
         self.max_steps = 800
         self.wind_max = 6.0
